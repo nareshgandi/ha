@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PostgreSQL High Availability Solutions</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.5.0/reveal.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.5.0/theme/night.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/monokai.min.css">
+    <style>
+        .reveal h1 { font-size: 2.2em; color: #58a6ff; }
+        .reveal h2 { font-size: 1.6em; color: #79c0ff; }
+        .reveal h3 { font-size: 1.3em; color: #a5d6ff; }
+        .reveal pre { font-size: 0.55em; }
+        .reveal code { background: #1e1e1e; padding: 2px 8px; border-radius: 4px; }
+        .reveal table { font-size: 0.7em; margin: 20px auto; }
+        .reveal th { background: #238636; color: white; padding: 10px; }
+        .reveal td { padding: 8px 15px; border: 1px solid #444; }
+        .reveal .success { color: #3fb950; }
+        .reveal .warning { color: #d29922; }
+        .reveal .error { color: #f85149; }
+        .reveal .highlight-box { background: #161b22; border-left: 4px solid #58a6ff; padding: 15px; margin: 20px 0; text-align: left; }
+        .reveal .architecture { font-family: monospace; font-size: 0.5em; line-height: 1.4; text-align: left; background: #0d1117; padding: 20px; border-radius: 8px; }
+        .reveal ul { text-align: left; }
+        .reveal li { margin: 10px 0; }
+        .two-columns { display: flex; gap: 40px; }
+        .two-columns > div { flex: 1; }
+    </style>
+</head>
+<body>
+    <div class="reveal">
+        <div class="slides">
+            
+            <!-- Title Slide -->
+            <section data-background-gradient="linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)">
+                <h1>PostgreSQL High Availability</h1>
+                <h3>PgBouncer • Pgpool-II • Patroni</h3>
+                <p style="margin-top: 50px; color: #8b949e;">PostgreSQL DBA Course</p>
+            </section>
+
+            <!-- Agenda -->
+            <section>
+                <h2>📋 Agenda</h2>
+                <ol>
+                    <li>Connection Pooling Fundamentals</li>
+                    <li><strong>PgBouncer</strong> - Lightweight Connection Pooler</li>
+                    <li><strong>Pgpool-II</strong> - Pooling + Load Balancing + HA</li>
+                    <li><strong>Patroni</strong> - Automated HA with Failover</li>
+                    <li>Comparison & When to Use What</li>
+                    <li>Hands-on Lab</li>
+                </ol>
+            </section>
+
+            <!-- Why Connection Pooling -->
+            <section>
+                <h2>🤔 Why Connection Pooling?</h2>
+                <div class="highlight-box">
+                    <h3 class="error">The Problem</h3>
+                    <pre><code>PostgreSQL max_connections = 100 (default)
+Each connection = ~10MB RAM
+1000 users hitting database = 💥 CRASH</code></pre>
+                </div>
+                <div class="highlight-box">
+                    <h3 class="success">The Solution</h3>
+                    <pre><code>1000 Users → Connection Pooler (20 connections) → PostgreSQL</code></pre>
+                </div>
+            </section>
+
+            <!-- Connection Pooling Benefits -->
+            <section>
+                <h2>✅ Benefits of Connection Pooling</h2>
+                <ul>
+                    <li>🧠 <strong>Reduced memory usage</strong> - Fewer server connections</li>
+                    <li>⚡ <strong>Faster connection times</strong> - Reuse existing connections</li>
+                    <li>📈 <strong>Better resource utilization</strong></li>
+                    <li>👥 <strong>Handle more concurrent users</strong></li>
+                </ul>
+            </section>
+
+            <!-- Connection Pooling Architecture -->
+            <section>
+                <h2>🔄 How Connection Pooling Works</h2>
+                <div class="architecture">
+<pre>
+┌─────────────────────────────────────────────────────────────┐
+│                         CLIENTS                              │
+│  [App1] [App2] [App3] [App4] ... [App200]                   │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ 200 client connections
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   CONNECTION POOLER                          │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │            Connection Pool (20 connections)          │   │
+│  └─────────────────────────────────────────────────────┘   │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ 20 server connections
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      POSTGRESQL                              │
+│                   max_connections = 100                      │
+└─────────────────────────────────────────────────────────────┘
+</pre>
+                </div>
+            </section>
+
+            <!-- PgBouncer Section -->
+            <section data-background="#1a472a">
+                <h1>🔵 PgBouncer</h1>
+                <h3>Lightweight Connection Pooler</h3>
+            </section>
+
+            <!-- PgBouncer Overview -->
+            <section>
+                <h2>What is PgBouncer?</h2>
+                <ul>
+                    <li>📦 <strong>Lightweight</strong> connection pooler for PostgreSQL</li>
+                    <li>💻 Written in C, very low memory footprint (~2KB per connection)</li>
+                    <li>⚡ Single-threaded, event-based architecture</li>
+                    <li>🏢 Created by Skype, now widely used</li>
+                </ul>
+                <div class="highlight-box">
+                    <strong>Key Features:</strong> Three pool modes, Authentication pass-through, Online restart, Admin console
+                </div>
+            </section>
+
+            <!-- PgBouncer Pool Modes -->
+            <section>
+                <h2>PgBouncer Pool Modes</h2>
+                <table>
+                    <tr>
+                        <th>Mode</th>
+                        <th>Description</th>
+                        <th>Best For</th>
+                    </tr>
+                    <tr>
+                        <td><strong>Session</strong></td>
+                        <td>Connection held until client disconnects</td>
+                        <td>Legacy apps, session variables</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Transaction</strong> ⭐</td>
+                        <td>Connection returned after each transaction</td>
+                        <td>Most applications (recommended)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Statement</strong></td>
+                        <td>Connection returned after each statement</td>
+                        <td>Simple queries, autocommit</td>
+                    </tr>
+                </table>
+            </section>
+
+            <!-- PgBouncer Configuration -->
+            <section>
+                <h2>PgBouncer Configuration</h2>
+                <pre><code class="ini">[databases]
+* = host=192.168.44.128 port=5432
+
+[pgbouncer]
+listen_addr = *
+listen_port = 6432
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt
+
+# Pool settings
+pool_mode = transaction
+default_pool_size = 20
+max_client_conn = 1000</code></pre>
+            </section>
+
+            <!-- PgBouncer Admin Commands -->
+            <section>
+                <h2>PgBouncer Admin Commands</h2>
+                <pre><code class="bash">psql -U postgres -h localhost -p 6432 pgbouncer</code></pre>
+                <table>
+                    <tr><th>Command</th><th>Description</th></tr>
+                    <tr><td><code>SHOW POOLS;</code></td><td>View connection pools</td></tr>
+                    <tr><td><code>SHOW CLIENTS;</code></td><td>View client connections</td></tr>
+                    <tr><td><code>SHOW SERVERS;</code></td><td>View server connections</td></tr>
+                    <tr><td><code>SHOW STATS;</code></td><td>View statistics</td></tr>
+                    <tr><td><code>RELOAD;</code></td><td>Reload configuration</td></tr>
+                </table>
+            </section>
+
+            <!-- PgBouncer Demo -->
+            <section>
+                <h2>🧪 PgBouncer Demo: High Concurrency</h2>
+                <div class="highlight-box">
+                    <h3 class="error">Without PgBouncer (Direct)</h3>
+                    <pre><code class="bash">pgbench -c 200 -t 10 -S -h 192.168.44.128 -p 5432 postgres
+# Result: FATAL: sorry, too many clients already ❌</code></pre>
+                </div>
+                <div class="highlight-box">
+                    <h3 class="success">With PgBouncer</h3>
+                    <pre><code class="bash">pgbench -c 200 -t 10 -S -h localhost -p 6432 postgres
+# Result: transactions: 2000/2000 ✅  |  tps = 4500</code></pre>
+                </div>
+            </section>
+
+            <!-- Pgpool-II Section -->
+            <section data-background="#1e3a5f">
+                <h1>🔷 Pgpool-II</h1>
+                <h3>Connection Pooling + Load Balancing + HA</h3>
+            </section>
+
+            <!-- Pgpool-II Overview -->
+            <section>
+                <h2>What is Pgpool-II?</h2>
+                <ul>
+                    <li>🛠️ <strong>Multi-function</strong> middleware for PostgreSQL</li>
+                    <li>📦 More than just connection pooling</li>
+                </ul>
+                <h3>Key Features</h3>
+                <div class="two-columns">
+                    <div>
+                        <ul>
+                            <li>✅ Connection Pooling</li>
+                            <li>⚖️ Load Balancing</li>
+                            <li>🔄 Automatic Failover</li>
+                        </ul>
+                    </div>
+                    <div>
+                        <ul>
+                            <li>📊 Replication</li>
+                            <li>💾 Query Caching</li>
+                            <li>👁️ Watchdog for HA</li>
+                        </ul>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Pgpool-II Architecture -->
+            <section>
+                <h2>Pgpool-II Architecture</h2>
+                <div class="architecture">
+<pre>
+                        APPLICATIONS
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                        PGPOOL-II                             │
+│                       Port: 9999                             │
+│  • Connection Pooling    • Health Check                     │
+│  • Load Balancing        • Automatic Failover               │
+└──────────────┬─────────────────────────┬────────────────────┘
+               │                         │
+               ▼                         ▼
+┌──────────────────────────┐  ┌──────────────────────────┐
+│       PRIMARY            │  │       STANDBY            │
+│   192.168.44.128:5432    │  │   192.168.44.129:5432    │
+│   (Read + Write)         │  │   (Read Only)            │
+└──────────────────────────┘  └──────────────────────────┘
+</pre>
+                </div>
+            </section>
+
+            <!-- Pgpool-II Load Balancing -->
+            <section>
+                <h2>⚖️ Pgpool-II Load Balancing</h2>
+                <div class="highlight-box">
+                    <pre><code>SELECT queries  ──► Load Balanced (Primary + Standby)
+INSERT/UPDATE   ──► Primary Only</code></pre>
+                </div>
+                <pre><code class="ini"># Backend weights
+backend_hostname0 = '192.168.44.128'
+backend_weight0 = 1      # 50% of reads
+
+backend_hostname1 = '192.168.44.129'
+backend_weight1 = 1      # 50% of reads</code></pre>
+            </section>
+
+            <!-- Pgpool-II Monitoring -->
+            <section>
+                <h2>📊 Pgpool-II Monitoring</h2>
+                <pre><code class="bash">psql -U postgres -p 9999 -c "show pool_nodes"</code></pre>
+                <pre><code> node_id |    hostname    | port | status | pg_status | role    
+---------+----------------+------+--------+-----------+---------
+ 0       | 192.168.44.128 | 5432 | up     | up        | primary 
+ 1       | 192.168.44.129 | 5432 | up     | up        | standby</code></pre>
+            </section>
+
+            <!-- Patroni Section -->
+            <section data-background="#4a1942">
+                <h1>🟣 Patroni</h1>
+                <h3>Automated HA with Failover</h3>
+            </section>
+
+            <!-- Patroni Overview -->
+            <section>
+                <h2>What is Patroni?</h2>
+                <ul>
+                    <li>🏗️ <strong>Template</strong> for PostgreSQL HA with automatic failover</li>
+                    <li>🔗 Uses distributed consensus (etcd, Consul, ZooKeeper)</li>
+                    <li>🏢 Created by <strong>Zalando</strong></li>
+                    <li>🏆 <strong>Industry standard</strong> for PostgreSQL HA</li>
+                </ul>
+                <div class="highlight-box">
+                    <strong>Key Features:</strong> Automatic failover, REST API, Watchdog support, Cluster bootstrap
+                </div>
+            </section>
+
+            <!-- Patroni Architecture -->
+            <section>
+                <h2>Patroni Architecture</h2>
+                <div class="architecture">
+<pre>
+                        CLIENTS (VIP: 192.168.44.140)
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│                          HAPROXY                              │
+│      Primary: Port 5000        Standby: Port 5001            │
+└──────────────┬─────────────────────────┬─────────────────────┘
+               │                         │
+    ┌──────────┴──────────┬──────────────┴──────────┐
+    ▼                     ▼                         ▼
+┌─────────┐         ┌─────────┐              ┌─────────┐
+│  lab01  │         │  lab02  │              │  lab03  │
+│ LEADER  │◄───────►│ REPLICA │◄────────────►│ REPLICA │
+│ Patroni │         │ Patroni │              │ Patroni │
+└────┬────┘         └────┬────┘              └────┬────┘
+     └──────────────┬────┴───────────────────────┘
+                    ▼
+          ┌─────────────────┐
+          │      ETCD       │
+          │  (Leader Lock)  │
+          └─────────────────┘
+</pre>
+                </div>
+            </section>
+
+            <!-- Patroni Components -->
+            <section>
+                <h2>🧩 Patroni Components</h2>
+                <table>
+                    <tr><th>Component</th><th>Purpose</th></tr>
+                    <tr><td><strong>Patroni</strong></td><td>HA agent on each PostgreSQL node</td></tr>
+                    <tr><td><strong>etcd</strong></td><td>Distributed key-value store (consensus)</td></tr>
+                    <tr><td><strong>HAProxy</strong></td><td>Load balancer, routes to current leader</td></tr>
+                    <tr><td><strong>Keepalived</strong></td><td>Manages Virtual IP (VIP)</td></tr>
+                    <tr><td><strong>Watchdog</strong></td><td>Fencing (prevents split-brain)</td></tr>
+                </table>
+            </section>
+
+            <!-- Patroni Failover -->
+            <section>
+                <h2>🔄 How Patroni Failover Works</h2>
+                <div class="highlight-box">
+                    <strong>Step 1:</strong> Leader Failure Detected<br>
+                    <code>etcd detects: lab01 (leader) not responding → Leader lock expires</code>
+                </div>
+                <div class="highlight-box">
+                    <strong>Step 2:</strong> New Leader Election<br>
+                    <code>lab02 acquires lock first → Becomes new leader</code>
+                </div>
+                <div class="highlight-box">
+                    <strong>Step 3:</strong> Promotion & Recovery<br>
+                    <code>lab02 promotes → lab03 follows → lab01 rejoins as replica</code>
+                </div>
+                <p><strong>Total failover time: ~10-30 seconds</strong></p>
+            </section>
+
+            <!-- Patroni Commands -->
+            <section>
+                <h2>Patroni Management Commands</h2>
+                <pre><code class="bash"># Cluster Status
+patronictl -c /etc/patroni/patroni.yml list</code></pre>
+                <pre><code>+ Cluster: postgres -------+----+-----------+
+| Member |      Host      | Role    | State     |
++--------+----------------+---------+-----------+
+| lab01  | 192.168.44.132 | Leader  | running   |
+| lab02  | 192.168.44.133 | Replica | streaming |
+| lab03  | 192.168.44.130 | Replica | streaming |</code></pre>
+                <pre><code class="bash"># Switchover (Planned)
+patronictl -c /etc/patroni/patroni.yml switchover
+
+# Failover (Emergency)
+patronictl -c /etc/patroni/patroni.yml failover</code></pre>
+            </section>
+
+            <!-- Comparison -->
+            <section>
+                <h2>📊 Comparison</h2>
+                <table style="font-size: 0.6em;">
+                    <tr>
+                        <th>Feature</th>
+                        <th>PgBouncer</th>
+                        <th>Pgpool-II</th>
+                        <th>Patroni</th>
+                    </tr>
+                    <tr>
+                        <td>Connection Pooling</td>
+                        <td class="success">✅ Excellent</td>
+                        <td class="success">✅ Good</td>
+                        <td class="error">❌ No</td>
+                    </tr>
+                    <tr>
+                        <td>Load Balancing</td>
+                        <td class="error">❌ No</td>
+                        <td class="success">✅ Yes</td>
+                        <td class="warning">⚠️ Via HAProxy</td>
+                    </tr>
+                    <tr>
+                        <td>Automatic Failover</td>
+                        <td class="error">❌ No</td>
+                        <td class="success">✅ Yes</td>
+                        <td class="success">✅ Yes</td>
+                    </tr>
+                    <tr>
+                        <td>Memory Usage</td>
+                        <td>Very Low</td>
+                        <td>Medium</td>
+                        <td>Low</td>
+                    </tr>
+                    <tr>
+                        <td>Complexity</td>
+                        <td class="success">Low</td>
+                        <td class="warning">Medium</td>
+                        <td class="error">High</td>
+                    </tr>
+                </table>
+            </section>
+
+            <!-- When to Use -->
+            <section>
+                <h2>🤔 When to Use What?</h2>
+                <div class="two-columns">
+                    <div>
+                        <h3>🔵 PgBouncer</h3>
+                        <ul>
+                            <li>Connection pooling only</li>
+                            <li>Minimal overhead</li>
+                            <li>Already have HA</li>
+                        </ul>
+                        <h3>🔷 Pgpool-II</h3>
+                        <ul>
+                            <li>Pooling + Load balancing</li>
+                            <li>Single solution</li>
+                            <li>2-node setups</li>
+                        </ul>
+                    </div>
+                    <div>
+                        <h3>🟣 Patroni</h3>
+                        <ul>
+                            <li>Production HA cluster</li>
+                            <li>Automatic failover</li>
+                            <li>3+ node clusters</li>
+                            <li>Cloud deployments</li>
+                        </ul>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Architecture Patterns -->
+            <section>
+                <h2>🏗️ Common Architecture Patterns</h2>
+                <div class="highlight-box">
+                    <strong>Pattern 1: Simple</strong><br>
+                    <code>Apps → PgBouncer → Primary → Standby</code>
+                </div>
+                <div class="highlight-box">
+                    <strong>Pattern 2: Load Balanced</strong><br>
+                    <code>Apps → Pgpool-II → Primary + Standby</code>
+                </div>
+                <div class="highlight-box">
+                    <strong>Pattern 3: Enterprise HA</strong><br>
+                    <code>Apps → PgBouncer → HAProxy → Patroni (3 nodes) + etcd</code>
+                </div>
+            </section>
+
+            <!-- Lab Section -->
+            <section data-background="#1f4068">
+                <h1>🔬 Hands-on Lab</h1>
+            </section>
+
+            <!-- Lab Commands -->
+            <section>
+                <h2>Lab Setup Commands</h2>
+                <pre><code class="bash"># Lab 1: PgBouncer
+./pgbouncer_setup.sh 192.168.44.128
+
+# Lab 2: Pgpool-II
+./pgpool_setup.sh 192.168.44.128 192.168.44.129
+
+# Lab 3: Patroni HA Cluster
+./patroni_ha_setup.sh 192.168.44.132 192.168.44.133 192.168.44.130 192.168.44.140
+
+# Cleanup (for re-testing)
+./patroni_cleanup.sh 192.168.44.132 192.168.44.133 192.168.44.130</code></pre>
+            </section>
+
+            <!-- Lab Tests -->
+            <section>
+                <h2>Lab Tests</h2>
+                <pre><code class="bash"># PgBouncer - High Concurrency Test
+pgbench -c 200 -t 10 -S -h localhost -p 6432 postgres
+
+# Pgpool-II - Show Nodes
+psql -U postgres -p 9999 -c "show pool_nodes"
+
+# Patroni - Cluster Status
+patronictl -c /etc/patroni/patroni.yml list
+
+# Patroni - Switchover Test
+patronictl -c /etc/patroni/patroni.yml switchover</code></pre>
+            </section>
+
+            <!-- Summary -->
+            <section>
+                <h2>📝 Summary</h2>
+                <table>
+                    <tr><th>Solution</th><th>Primary Use Case</th><th>Complexity</th></tr>
+                    <tr><td>PgBouncer</td><td>Connection pooling</td><td class="success">Low</td></tr>
+                    <tr><td>Pgpool-II</td><td>Pooling + LB + HA</td><td class="warning">Medium</td></tr>
+                    <tr><td>Patroni</td><td>Enterprise HA</td><td class="error">High</td></tr>
+                </table>
+                <div class="highlight-box">
+                    <strong>Key Takeaways:</strong>
+                    <ul>
+                        <li>Connection pooling is essential for production</li>
+                        <li>Patroni is the industry standard for HA</li>
+                        <li>Combine tools for best results</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Questions -->
+            <section data-background-gradient="linear-gradient(135deg, #1a1a2e 0%, #16213e 100%)">
+                <h1>❓ Questions?</h1>
+                <br>
+                <h3>Resources</h3>
+                <p>
+                    PgBouncer: pgbouncer.org<br>
+                    Pgpool-II: pgpool.net<br>
+                    Patroni: github.com/zalando/patroni<br>
+                    PostgreSQL HA: postgreshelp.com
+                </p>
+            </section>
+
+            <!-- Thank You -->
+            <section data-background-gradient="linear-gradient(135deg, #16213e 0%, #1a1a2e 100%)">
+                <h1>🙏 Thank You!</h1>
+            </section>
+
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.5.0/reveal.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/reveal.js/4.5.0/plugin/highlight/highlight.min.js"></script>
+    <script>
+        Reveal.initialize({
+            hash: true,
+            slideNumber: true,
+            plugins: [ RevealHighlight ]
+        });
+    </script>
+</body>
+</html>
