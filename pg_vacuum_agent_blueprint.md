@@ -6,22 +6,472 @@
 
 ## Table of Contents
 
-1. [Agent Architecture & Mental Model](#1-agent-architecture--mental-model)
-2. [Problem Taxonomy — The Vacuum Universe](#2-problem-taxonomy--the-vacuum-universe)
-3. [Diagnostic Query Library](#3-diagnostic-query-library)
-4. [Decision Engine — Detection & Triage Logic](#4-decision-engine--detection--triage-logic)
-5. [Remediation Playbooks](#5-remediation-playbooks)
-6. [Interactive Chatbot Design](#6-interactive-chatbot-design)
-7. [Autonomous Mode — Continuous Monitoring](#7-autonomous-mode--continuous-monitoring)
-8. [Agent State Machine](#8-agent-state-machine)
-9. [Safety & Guardrails](#9-safety--guardrails)
-10. [Implementation Reference](#10-implementation-reference)
+1. [Introduction](#1-introduction)
+2. [Objectives](#2-objectives)
+3. [Understanding Vacuum — Why It Matters](#3-understanding-vacuum--why-it-matters)
+4. [Vacuum Issues — The Complete Landscape](#4-vacuum-issues--the-complete-landscape)
+5. [Vacuum Blockers — What Prevents Cleanup](#5-vacuum-blockers--what-prevents-cleanup)
+6. [Agent Architecture & Mental Model](#6-agent-architecture--mental-model)
+7. [Problem Taxonomy — The Vacuum Universe](#7-problem-taxonomy--the-vacuum-universe)
+8. [Diagnostic Query Library](#8-diagnostic-query-library)
+9. [Decision Engine — Detection & Triage Logic](#9-decision-engine--detection--triage-logic)
+10. [Remediation Playbooks](#10-remediation-playbooks)
+11. [Interactive Chatbot Design](#11-interactive-chatbot-design)
+12. [Autonomous Mode — Continuous Monitoring](#12-autonomous-mode--continuous-monitoring)
+13. [Agent State Machine](#13-agent-state-machine)
+14. [Safety & Guardrails](#14-safety--guardrails)
+15. [Implementation Reference](#15-implementation-reference)
 
 ---
 
-## 1. Agent Architecture & Mental Model
+## 1. Introduction
 
-### 1.1 Core Philosophy
+### 1.1 What Is This Document?
+
+This document is the **complete engineering blueprint** for building an LLM-powered autonomous agent that detects, diagnoses, and resolves every category of vacuum-related problem in PostgreSQL. It is designed for database engineers and developers building production-grade tooling.
+
+PostgreSQL's MVCC (Multi-Version Concurrency Control) architecture is powerful — it allows readers and writers to never block each other. But this power comes at a cost: **dead tuples**. Every UPDATE creates a new version of the row and leaves the old one behind. Every DELETE marks a row as dead but doesn't reclaim the space. Over time, without proper vacuum management, databases accumulate massive amounts of dead data, indexes bloat, transaction IDs approach wraparound, and performance degrades — sometimes catastrophically.
+
+Despite vacuum being the single most critical maintenance operation in PostgreSQL, most production incidents related to vacuum share common traits:
+
+- The problem was **detectable days or weeks** before it became critical
+- The DBA either didn't know what to look for or didn't have time to check
+- Automated monitoring either didn't exist or was too shallow (only checking basic dead tuple counts)
+- When the problem became urgent, the remediation path was unclear or risky
+
+**This agent solves all four problems.** It continuously monitors, deeply diagnoses, clearly explains, and safely remediates — either autonomously or interactively through a conversational interface.
+
+### 1.2 Who Is This For?
+
+- **Database Engineers / DBAs** building internal tooling for PostgreSQL fleet management
+- **Platform Teams** adding autonomous database health into their infrastructure
+- **Training Instructors** teaching production PostgreSQL operations
+- **SRE Teams** wanting an intelligent first-responder for vacuum incidents
+- **Managed Service Providers** offering proactive database maintenance
+
+### 1.3 What Makes This Agent Different?
+
+| Traditional Monitoring | This Vacuum Agent |
+|------------------------|-------------------|
+| Checks dead tuple counts | Understands the **full vacuum ecosystem** — bloat, wraparound, TOAST, catalog, indexes, blockers, configuration, and their interactions |
+| Fires alerts | **Diagnoses root cause** — "vacuum isn't running because an abandoned replication slot is holding back xmin" |
+| Shows dashboards | **Explains in plain language** — adapts from beginner to expert based on the audience |
+| Requires DBA to decide next steps | **Generates remediation plans** with exact SQL, safety checks, and rollback awareness |
+| Reactive only | **Predicts problems** — "at current XID growth rate, you have 12 days before danger zone" |
+| Single-dimension checks | **Correlates across dimensions** — understands that high index bloat may be caused by vacuum never completing index cleanup due to maintenance_work_mem being too low |
+
+---
+
+## 2. Objectives
+
+### 2.1 Primary Objectives
+
+The vacuum agent must accomplish these goals:
+
+**O1 — Complete Coverage:** Detect and handle every vacuum-related problem in PostgreSQL, including but not limited to: dead tuple accumulation, table bloat, index bloat, TOAST bloat, orphaned TOAST, catalog table bloat, XID wraparound, MultiXact wraparound, vacuum performance issues, autovacuum configuration problems, vacuum blockers, and visibility/free-space map anomalies.
+
+**O2 — Autonomous Detection:** Run continuously in the background, scanning all monitored databases on configurable schedules. Detect problems before they become incidents. Forecast when thresholds will be breached.
+
+**O3 — Intelligent Diagnosis:** Go beyond "dead tuples are high" to identify **why** — is autovacuum disabled? Is a long-running transaction blocking cleanup? Is a replication slot preventing tuple removal? Is maintenance_work_mem too small for the index vacuum phase?
+
+**O4 — Interactive Communication:** Serve as a conversational chatbot that can explain vacuum concepts and findings to users of all technical levels — from junior developers asking "why is my table slow?" to senior DBAs asking "what's the MXID age distribution across my catalog tables?"
+
+**O5 — Safe Remediation:** Execute fixes with appropriate safety guardrails. Auto-remediate low-risk actions (standard VACUUM, ANALYZE, per-table config tuning). Require explicit human approval for high-risk actions (VACUUM FULL, DROP INDEX, terminate sessions, drop replication slots).
+
+**O6 — Audit Trail:** Log every finding, every action, every approval. Provide complete traceability for compliance and post-incident review.
+
+### 2.2 Success Metrics
+
+| Metric | Target |
+|--------|--------|
+| Time from problem onset to detection | < 15 minutes for P0/P1, < 1 hour for P2+ |
+| False positive rate | < 5% of alerts |
+| Mean time to remediation (auto-safe issues) | < 5 minutes |
+| Wraparound emergencies on monitored databases | Zero (preventive action should always intervene) |
+| Bloat on critical tables | Maintained below 30% |
+| User satisfaction (interactive mode) | Users resolve their issue within the conversation |
+
+### 2.3 Non-Goals (Scope Boundaries)
+
+The agent does **not** handle:
+
+- Query optimization (that's a planner/index advisor problem)
+- Backup/recovery operations
+- Replication setup and management (though it monitors slots)
+- Schema design recommendations
+- Non-vacuum-related performance tuning (though it may surface related findings)
+- PostgreSQL upgrades
+
+---
+
+## 3. Understanding Vacuum — Why It Matters
+
+### 3.1 The MVCC Foundation
+
+PostgreSQL uses Multi-Version Concurrency Control. When a row is updated, PostgreSQL does NOT overwrite the existing row. Instead:
+
+```
+BEFORE UPDATE:
+┌────────────────────────────────────┐
+│ Page                               │
+│ ┌──────────────────────────────┐   │
+│ │ Row v1: name='Alice', age=30 │   │  ← Live tuple (xmin=100, xmax=∞)
+│ └──────────────────────────────┘   │
+└────────────────────────────────────┘
+
+AFTER UPDATE (SET age=31):
+┌────────────────────────────────────┐
+│ Page                               │
+│ ┌──────────────────────────────┐   │
+│ │ Row v1: name='Alice', age=30 │   │  ← DEAD tuple (xmin=100, xmax=200)
+│ └──────────────────────────────┘   │
+│ ┌──────────────────────────────┐   │
+│ │ Row v2: name='Alice', age=31 │   │  ← Live tuple (xmin=200, xmax=∞)
+│ └──────────────────────────────┘   │
+└────────────────────────────────────┘
+```
+
+The old version (v1) cannot be immediately removed because another transaction that started before the UPDATE might still need to see it (snapshot isolation). Once **no active transaction** can see v1, it becomes a **dead tuple** — garbage that wastes space and slows down scans.
+
+**VACUUM is the garbage collector.** It reclaims dead tuples so the space can be reused.
+
+### 3.2 What Vacuum Actually Does (Step by Step)
+
+```
+VACUUM execution phases:
+
+1. INITIALIZING
+   └── Acquire ShareUpdateExclusiveLock (doesn't block reads/writes)
+
+2. SCANNING HEAP
+   └── Scan every page in the table
+       ├── Identify dead tuples (not visible to any active snapshot)
+       ├── Collect dead tuple TIDs in maintenance_work_mem
+       └── If maintenance_work_mem fills up → trigger index vacuum early
+
+3. VACUUMING INDEXES (for each index on the table)
+   └── Scan the entire index
+       ├── Remove index entries pointing to dead tuples
+       └── This is the MOST EXPENSIVE phase for large tables with many indexes
+
+4. VACUUMING HEAP
+   └── Mark dead tuple space as reusable
+       └── Update the Free Space Map (FSM)
+
+5. CLEANING UP INDEXES (repeat 3-4 if more dead tuples remain)
+
+6. TRUNCATING (optional)
+   └── If trailing pages are all empty → truncate the file
+       └── Briefly acquires AccessExclusiveLock
+
+7. UPDATING STATS
+   └── Update pg_class.relfrozenxid, relminmxid
+   └── Update pg_stat_user_tables counters
+
+8. FREEZING (if needed)
+   └── Mark old tuples as "frozen" so their XID can be reused
+   └── Update the Visibility Map (all-frozen bit)
+```
+
+### 3.3 Types of Vacuum
+
+| Type | Trigger | Lock | What It Does | When to Use |
+|------|---------|------|-------------|-------------|
+| **Lazy VACUUM** (standard) | Manual or autovacuum | ShareUpdateExclusive (non-blocking) | Reclaims dead tuples, updates FSM, optionally freezes | Routine maintenance |
+| **VACUUM FREEZE** | Manual or anti-wraparound autovacuum | ShareUpdateExclusive | Aggressively freezes all eligible tuples | Preventing XID wraparound |
+| **VACUUM FULL** | Manual only | AccessExclusive (**blocks everything**) | Rewrites the entire table, reclaims all bloat | Last resort for severe bloat |
+| **Autovacuum (regular)** | Threshold: dead tuples > threshold + scale_factor × live tuples | ShareUpdateExclusive | Same as lazy vacuum | Automatic |
+| **Autovacuum (anti-wraparound)** | `age(relfrozenxid) > autovacuum_freeze_max_age` | ShareUpdateExclusive | VACUUM FREEZE triggered by age | Automatic, cannot be disabled |
+| **Autovacuum (insert-triggered, PG13+)** | Insert count exceeds threshold | ShareUpdateExclusive | Freezes insert-only tables | Automatic |
+| **Failsafe autovacuum (PG14+)** | `age(relfrozenxid) > vacuum_failsafe_age` (default 1.6B) | ShareUpdateExclusive, ignores cost_delay | Emergency full-speed freeze | Automatic last resort |
+
+### 3.4 Key Internal Structures
+
+**Visibility Map (VM):** 2 bits per heap page. Bit 1 = "all visible" (all tuples visible to all transactions). Bit 2 = "all frozen" (all tuples frozen). Index-only scans use bit 1. Vacuum freeze uses bit 2 to skip already-frozen pages.
+
+**Free Space Map (FSM):** Tracks available space in each heap page. Used by INSERT/UPDATE to find pages with room. Updated by vacuum. Inaccurate FSM → table grows even when there's free space.
+
+**Transaction ID (XID):** 32-bit counter (0 to ~4.2 billion, but only ~2.1 billion usable via modular arithmetic). Every transaction that writes gets an XID. If XID wraps around without freezing, the database **shuts down** to prevent data corruption. This is the most dangerous vacuum failure mode.
+
+**MultiXact ID (MXID):** Used when multiple transactions hold row-level locks. Has its own wraparound problem, separate from XID.
+
+---
+
+## 4. Vacuum Issues — The Complete Landscape
+
+This section catalogs every vacuum-related issue the agent must detect and handle. Each issue includes what it is, why it happens, how to detect it, and its impact.
+
+### 4.1 Dead Tuple Accumulation
+
+**What:** Dead tuples pile up faster than vacuum can reclaim them.
+
+**Why it happens:**
+- High UPDATE/DELETE workload exceeds autovacuum throughput
+- Autovacuum cost_delay throttles I/O too aggressively
+- Too few autovacuum workers for the number of active tables
+- Autovacuum thresholds too high (default scale_factor=0.2 is too loose for large tables — a 100M row table allows 20M dead tuples before triggering vacuum)
+
+**Impact:** Sequential scans slow down (must skip dead tuples), indexes grow, disk usage increases, query latency rises.
+
+**Detection signal:** `n_dead_tup / (n_live_tup + n_dead_tup) > 10%` in `pg_stat_user_tables`.
+
+### 4.2 Table Bloat
+
+**What:** The physical size of the table far exceeds the actual live data. Even after vacuum reclaims dead tuples, the space is only reused internally — it is NOT returned to the OS (unless VACUUM FULL or pg_repack is used).
+
+**Why it happens:**
+- Sustained dead tuple accumulation over time
+- Bulk DELETE without subsequent VACUUM FULL
+- UPDATE patterns on wide rows causing non-HOT updates
+- TOAST detoasting and retoasting on updates
+
+**Impact:** Larger table = more I/O for every sequential scan, more buffer cache consumed, more WAL for VACUUM FULL/repack, slower backups.
+
+**Detection signal:** Statistical bloat estimation (compare actual table size vs estimated live data size using pg_stats column widths).
+
+### 4.3 Index Bloat
+
+**What:** B-tree indexes grow beyond their optimal size. Index pages become sparsely filled after deletions, and newly inserted keys may not fill the gaps efficiently.
+
+**Why it happens:**
+- Vacuum removes dead index entries but doesn't compact remaining ones
+- Monotonically increasing keys (e.g., serial IDs, timestamps) cause rightward growth with left pages becoming sparse
+- Many indexes on a table = vacuum must do an index cleanup pass for each index, increasing vacuum time and potentially causing it to bail out early
+
+**Impact:** Slower index scans, more buffer cache consumed by indexes, each vacuum cycle takes longer (must scan all indexes).
+
+**Detection signal:** Index size relative to table size (ratio > 2x is suspicious for non-covering indexes). pgstatindex extension for precise leaf page density.
+
+### 4.4 TOAST Bloat
+
+**What:** PostgreSQL stores values > ~2KB in a separate TOAST (The Oversized-Attribute Storage Technique) table. TOAST tables can bloat independently of the main table.
+
+**Why it happens:**
+- Updates to large columns (JSONB, TEXT, BYTEA) create new TOAST entries; old ones become dead
+- Vacuum on the main table triggers vacuum on TOAST, but if vacuum is blocked or slow, TOAST bloat accumulates
+- Some UPDATE patterns touch non-TOAST columns but PG still detoasts and retoasts if the storage strategy is `extended`
+
+**Impact:** TOAST can dominate total table size (sometimes 90%+ of pg_total_relation_size). TOAST bloat is often the hidden cause of "my table is huge but only has 10K rows."
+
+**Detection signal:** TOAST table size vs main table size ratio, TOAST dead tuples in pg_stat_all_tables.
+
+### 4.5 Orphaned TOAST
+
+**What:** TOAST chunks that no longer have a corresponding row in the main table. The main row was deleted but the TOAST cleanup failed or was interrupted.
+
+**Why it happens:**
+- Crash during vacuum of TOAST table
+- Corruption in TOAST pointer
+- Rare bugs in PostgreSQL (historically occurred in specific versions)
+- Interrupted VACUUM FULL
+
+**Impact:** Wasted space that normal vacuum cannot reclaim because there's no main-table dead tuple to trigger the cleanup.
+
+**Detection signal:** TOAST chunk count per main row is anomalously high (e.g., >50 chunks per row when column sizes don't justify it), or TOAST table keeps growing even as main table shrinks.
+
+### 4.6 Catalog Table Bloat
+
+**What:** System catalog tables (`pg_class`, `pg_attribute`, `pg_depend`, `pg_statistic`, etc.) accumulate bloat from frequent DDL operations.
+
+**Why it happens:**
+- Applications that CREATE/DROP temp tables frequently (every transaction creates dozens of pg_attribute rows that become dead when the temp table is dropped)
+- ORMs that run excessive ALTER TABLE operations
+- Frequent CREATE/DROP of functions, types, extensions
+- Autovacuum handles catalog tables but with lower priority
+
+**Impact:** Every query plan compilation reads catalog tables. Bloated catalogs slow down query planning, connection establishment, and DDL. In extreme cases, pg_attribute can grow to multiple GB, adding seconds to every new connection.
+
+**Detection signal:** pg_class/pg_attribute/pg_depend physical size vs row count. Dead tuple counts on catalog tables.
+
+### 4.7 Transaction ID (XID) Wraparound
+
+**What:** PostgreSQL's 32-bit transaction ID counter has ~2.1 billion usable values. If a table's oldest unfrozen transaction exceeds this range, the database **must shut down** to prevent transactions from becoming invisible (data appearing to vanish).
+
+**Why it happens:**
+- Anti-wraparound autovacuum is blocked (by long transactions, locks, replication slots)
+- Anti-wraparound autovacuum completes but is throttled so severely it can't keep up with XID consumption rate
+- Very large tables where vacuum freeze takes hours/days
+
+**Impact:** If `age(relfrozenxid)` approaches ~2.1 billion: PostgreSQL refuses new write transactions. At the limit: **database shuts down entirely.** This is the only vacuum problem that can make PostgreSQL completely unavailable.
+
+**Detection signal:** `age(relfrozenxid)` per table and `age(datfrozenxid)` per database. Thresholds: Warning at 200M, Danger at 500M, Critical at 1.2B.
+
+### 4.8 MultiXact ID Wraparound
+
+**What:** Similar to XID wraparound but for MultiXact IDs. MultiXacts are used when multiple transactions hold row-level locks simultaneously (e.g., SELECT ... FOR KEY SHARE from foreign key checks).
+
+**Why it happens:**
+- Same blockers as XID wraparound
+- Applications with heavy foreign key activity generate many MultiXact IDs
+- `mxid_age(relminmxid)` not monitored as commonly as XID age
+
+**Impact:** Same as XID wraparound — database can refuse transactions.
+
+**Detection signal:** `mxid_age(relminmxid)` per table.
+
+### 4.9 Vacuum Performance Issues
+
+**What:** Vacuum runs but is too slow, takes too long, or consumes excessive resources.
+
+**Why it happens:**
+- `vacuum_cost_delay` too high → vacuum sleeps too often
+- `maintenance_work_mem` too low → vacuum does multiple index passes (fills up TID buffer, must do an index vacuum pass, then restart heap scan)
+- Too many indexes on the table → each dead tuple requires removal from every index
+- I/O contention with application queries
+- Vacuum holding lightweight locks that block other operations
+
+**Impact:** Vacuum "falls behind" — dead tuples grow faster than vacuum reclaims them. Vacuum runs for hours on large tables, consuming autovacuum workers and starving other tables.
+
+**Detection signal:** `pg_stat_progress_vacuum` showing slow progress, vacuum duration from pg_stat_activity, index_vacuum_count > 1 in progress view (indicates maintenance_work_mem exhaustion).
+
+### 4.10 Statistics & Visibility Issues
+
+**What:** Stale or missing statistics cause the query planner to make bad decisions, and visibility map corruption causes vacuum to do unnecessary work (or miss necessary work).
+
+**Why it happens:**
+- ANALYZE hasn't run after bulk data load
+- `track_counts = off` (breaks autovacuum entirely)
+- Stats collector crash or heavy load causing stat drops
+- VM corruption from crash recovery or storage issues
+
+**Impact:** Bad query plans (wrong join strategies, bad row estimates). Vacuum rescanning pages that are already clean. Index-only scans failing to use VM.
+
+**Detection signal:** `last_autoanalyze` is NULL or very old on active tables. `n_live_tup` showing 0 on tables with data. VM coverage low on tables that haven't been modified.
+
+### 4.11 Configuration Issues
+
+**What:** Autovacuum parameters are not tuned for the workload.
+
+**Common misconfigurations:**
+
+| Parameter | Default | Problem | Better Value |
+|-----------|---------|---------|-------------|
+| `autovacuum_vacuum_scale_factor` | 0.2 | For a 100M row table, allows 20M dead tuples before vacuum triggers | 0.01 for large tables (per-table override) |
+| `autovacuum_vacuum_threshold` | 50 | Fine for small tables, irrelevant for large ones | Increase for tiny tables to avoid over-vacuuming |
+| `vacuum_cost_delay` | 2ms (PG12+) | Can throttle vacuum too aggressively on fast storage (NVMe) | 0 for NVMe/SSD with dedicated I/O |
+| `autovacuum_max_workers` | 3 | Not enough for databases with 500+ active tables | 5–8 depending on CPU/IO |
+| `maintenance_work_mem` | 64MB | Forces multiple index passes on tables with >~1M dead tuples | 1GB–2GB for production |
+| `autovacuum_vacuum_cost_delay` | 2ms | Same as vacuum_cost_delay for autovacuum workers | 0–2ms based on storage |
+| `log_autovacuum_min_duration` | -1 (disabled) | You can't fix what you can't see | 0 (log all vacuum runs) |
+
+---
+
+## 5. Vacuum Blockers — What Prevents Cleanup
+
+Vacuum can only remove a dead tuple when **no active transaction anywhere in the cluster** can still see it. Several things can hold back vacuum's cleanup horizon:
+
+### 5.1 Long-Running Transactions
+
+**The Problem:** A transaction started 6 hours ago is still open. It holds a snapshot that says "I need to see all data as of 6 hours ago." Vacuum cannot remove any tuples created after that snapshot — even if the transaction isn't reading those tables.
+
+**How it blocks:**
+```
+Timeline:
+  T1 (6hrs ago) ──── starts transaction, holds snapshot
+  T2 (5hrs ago) ──── UPDATE orders SET status='shipped' (creates dead tuple)
+  T3 (now)      ──── VACUUM orders → Cannot remove T2's dead tuple because T1 might read it
+```
+
+**Detection:** `pg_stat_activity WHERE state != 'idle' AND xact_start < now() - interval '30 min'`
+
+**Resolution:** Identify the session, determine if it's abandoned, terminate if appropriate. Set `idle_in_transaction_session_timeout` to prevent recurrence.
+
+### 5.2 Idle-in-Transaction Sessions
+
+**The Problem:** Even worse than long-running queries — a session that started a transaction (`BEGIN`) but is now sitting idle. The application sent BEGIN, did some work, then went silent (bug, network issue, forgotten commit). The transaction holds an old snapshot indefinitely.
+
+**Why it's insidious:** It's silent. No query is running. It doesn't show up in slow query logs. But it holds back vacuum for **every table in the database**.
+
+**Detection:** `pg_stat_activity WHERE state = 'idle in transaction'`
+
+**Resolution:** `SET idle_in_transaction_session_timeout = '5min';` (kills sessions automatically). For immediate fix: `pg_terminate_backend(pid)`.
+
+### 5.3 Abandoned Replication Slots
+
+**The Problem:** Logical or physical replication slots tell PostgreSQL "don't throw away WAL segments or dead tuples that this subscriber hasn't consumed yet." If the subscriber disconnects and never comes back, the slot keeps holding back vacuum forever.
+
+**Impact cascade:**
+- Dead tuples accumulate across ALL tables
+- WAL segments pile up on disk (pg_wal grows unbounded)
+- XID age advances towards wraparound
+- This is the #1 cause of unexpected wraparound emergencies in production
+
+**Detection:** `pg_replication_slots WHERE active = false AND age(xmin) > 100000000`
+
+**Resolution:** `SELECT pg_drop_replication_slot('slot_name');` — but ONLY after confirming the subscriber is truly gone. Dropping an active slot breaks replication.
+
+### 5.4 hot_standby_feedback on Replicas
+
+**The Problem:** When `hot_standby_feedback = on` on a replica, it sends its oldest active transaction's xmin back to the primary. The primary then cannot vacuum tuples newer than that xmin — even if no primary transaction needs them.
+
+**Scenario:**
+```
+Primary: All transactions are short (seconds)
+Replica: Running a 4-hour analytics report
+Result:  Primary cannot vacuum ANY tuples created in the last 4 hours
+```
+
+**Detection:** Check `pg_stat_replication` for `backend_xmin` from replicas. If `age(backend_xmin)` is high, a replica is holding back the primary's vacuum.
+
+**Resolution:** Disable `hot_standby_feedback` on the replica (may cause query cancellation on replica). Or set `max_standby_streaming_delay` on the replica to limit how long queries can block.
+
+### 5.5 Prepared Transactions (Two-Phase Commit)
+
+**What:** `PREPARE TRANSACTION 'name'` creates a transaction that survives connection close and even server restart. It holds its snapshot until explicitly committed or rolled back.
+
+**Why it blocks vacuum:** A prepared transaction's XID is frozen in place. Vacuum cannot advance past it. If the application that created it crashes and nobody resolves it, it blocks vacuum forever.
+
+**Detection:** `pg_prepared_xacts` — any row here is suspicious. Check `age(transaction)`.
+
+**Resolution:** `COMMIT PREPARED 'name'` or `ROLLBACK PREPARED 'name'`. Requires understanding what the transaction was doing.
+
+### 5.6 Vacuum vs. Conflicting Locks
+
+**What:** Vacuum acquires `ShareUpdateExclusiveLock`, which conflicts with:
+- `SHARE` lock (explicit `LOCK TABLE IN SHARE MODE`)
+- `ShareRowExclusiveLock` (from `CREATE INDEX` non-concurrently, `ALTER TABLE`)
+- `ExclusiveLock` and `AccessExclusiveLock` (DDL, `VACUUM FULL`, `TRUNCATE`)
+
+**Impact:** If a DDL operation holds `AccessExclusiveLock` on a table for a long time (e.g., `ALTER TABLE ... ADD COLUMN` on a large table pre-PG11), autovacuum cannot process that table and will skip it.
+
+**Detection:** `pg_locks` joined with `pg_stat_activity` for autovacuum workers showing `granted = false`.
+
+**Resolution:** Audit long-running DDL. Use `CONCURRENTLY` variants where possible. Consider `lock_timeout` on autovacuum worker sessions.
+
+### 5.7 Blocker Interaction Matrix
+
+Understanding how blockers combine is critical:
+
+```
+                    Long     Idle-in    Repl     hot_standby   Prepared   Lock
+                    Xact     Xact       Slot     feedback      Xact       Conflict
+                    ─────    ─────      ─────    ─────         ─────      ─────
+Dead tuples pile    ✅        ✅         ✅       ✅             ✅          ✅
+up
+
+XID cannot          ✅        ✅         ✅       ✅             ✅          ✅
+advance (freeze)
+
+WAL retained        ❌        ❌         ✅       ❌             ❌          ❌
+on disk
+
+Affects ALL         ✅        ✅         ✅       ✅             ✅          ❌
+tables              (db-wide) (db-wide)  (db-wide) (db-wide)    (db-wide)  (per-table)
+
+Survives            ❌        ❌         ✅       ❌             ✅          ❌
+connection close
+
+Survives            ❌        ❌         ✅       ❌             ✅          ❌
+server restart
+```
+
+**Key insight for the agent:** When diagnosing vacuum failure, ALWAYS check blockers first. Suggesting "run VACUUM" when a replication slot is holding back xmin is useless — the vacuum will run but won't reclaim anything.
+
+---
+
+## 6. Agent Architecture & Mental Model
+
+### 6.1 Core Philosophy
 
 The agent operates on a **Detect → Diagnose → Decide → Act → Verify** loop (D³AV). Every vacuum-related problem in PostgreSQL is a symptom of one of three root causes:
 
@@ -42,7 +492,7 @@ The agent operates on a **Detect → Diagnose → Decide → Act → Verify** lo
 └─────────────────────────────────────────────────────┘
 ```
 
-### 1.2 Agent Modes
+### 6.2 Agent Modes
 
 | Mode | Trigger | Behaviour |
 |------|---------|-----------|
@@ -50,7 +500,7 @@ The agent operates on a **Detect → Diagnose → Decide → Act → Verify** lo
 | **Interactive** | User initiates chat | Conversational; asks clarifying questions, explains findings in plain language, suggests or executes actions with approval |
 | **Hybrid** | Autonomous detects critical issue | Switches to interactive to get human approval before aggressive action |
 
-### 1.3 Layered Detection Model
+### 6.3 Layered Detection Model
 
 ```
 Layer 0 — Heartbeat    : Is vacuum running at all? Autovacuum enabled?
@@ -66,9 +516,9 @@ Layer 8 — Configuration : Misconfigured vacuum parameters
 
 ---
 
-## 2. Problem Taxonomy — The Vacuum Universe
+## 7. Problem Taxonomy — The Vacuum Universe
 
-### 2.1 Complete Problem Map
+### 7.1 Complete Problem Map
 
 ```
 VACUUM PROBLEMS
@@ -139,9 +589,9 @@ VACUUM PROBLEMS
 
 ---
 
-## 3. Diagnostic Query Library
+## 8. Diagnostic Query Library
 
-### 3.0 Health Check Overview — Single Query Dashboard
+### 8.0 Health Check Overview — Single Query Dashboard
 
 ```sql
 -- MASTER HEALTH CHECK: Run this first in every diagnostic session
@@ -172,7 +622,7 @@ WITH vacuum_health AS (
 SELECT * FROM vacuum_health;
 ```
 
-### 3.1 Autovacuum Status & Activity
+### 8.1 Autovacuum Status & Activity
 
 ```sql
 -- Q01: Current autovacuum workers and what they're doing
@@ -237,7 +687,7 @@ WHERE n_dead_tup > (
 ORDER BY n_dead_tup DESC;
 ```
 
-### 3.2 Table Bloat Detection
+### 8.2 Table Bloat Detection
 
 ```sql
 -- Q04: Table bloat estimation using statistical approach
@@ -299,7 +749,7 @@ LIMIT 25;
 -- LIMIT 10;
 ```
 
-### 3.3 Index Bloat Detection
+### 8.3 Index Bloat Detection
 
 ```sql
 -- Q06: Index bloat estimation
@@ -363,7 +813,7 @@ WHERE (a.indkey::text = b.indkey::text)
 -- LIMIT 10;
 ```
 
-### 3.4 TOAST Bloat & Orphaned TOAST
+### 8.4 TOAST Bloat & Orphaned TOAST
 
 ```sql
 -- Q10: TOAST table sizes relative to main table
@@ -441,7 +891,7 @@ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
 ORDER BY COALESCE(s.avg_width, 0) DESC;
 ```
 
-### 3.5 Catalog Table Bloat
+### 8.5 Catalog Table Bloat
 
 ```sql
 -- Q14: Catalog table sizes and bloat indicators
@@ -487,7 +937,7 @@ WHERE c.relnamespace = 'pg_catalog'::regnamespace
 ORDER BY pg_relation_size(t.oid) DESC;
 ```
 
-### 3.6 Transaction ID Wraparound
+### 8.6 Transaction ID Wraparound
 
 ```sql
 -- Q17: Tables approaching XID wraparound — THE CRITICAL QUERY
@@ -544,7 +994,7 @@ WHERE c.relkind = 'r'
 ORDER BY mxid_age(c.relminmxid) DESC;
 ```
 
-### 3.7 Vacuum Blockers
+### 8.7 Vacuum Blockers
 
 ```sql
 -- Q20: Long-running transactions blocking vacuum
@@ -624,7 +1074,7 @@ WHERE blocked.backend_type = 'autovacuum worker'
   AND NOT bl.granted;
 ```
 
-### 3.8 Vacuum Performance & History
+### 8.8 Vacuum Performance & History
 
 ```sql
 -- Q25: Vacuum progress (PostgreSQL 9.6+)
@@ -679,7 +1129,7 @@ ORDER BY n_dead_tup DESC
 LIMIT 30;
 ```
 
-### 3.9 HOT Updates & Fillfactor
+### 8.9 HOT Updates & Fillfactor
 
 ```sql
 -- Q28: HOT update effectiveness
@@ -723,7 +1173,7 @@ WHERE c.relkind = 'r'
 ORDER BY s.n_tup_upd DESC;
 ```
 
-### 3.10 Visibility Map & Free Space Map
+### 8.10 Visibility Map & Free Space Map
 
 ```sql
 -- Q30: Visibility map coverage (needs pg_visibility extension)
@@ -757,9 +1207,9 @@ ORDER BY s.n_tup_upd DESC;
 
 ---
 
-## 4. Decision Engine — Detection & Triage Logic
+## 9. Decision Engine — Detection & Triage Logic
 
-### 4.1 Severity Classification
+### 9.1 Severity Classification
 
 ```
 SEVERITY LEVELS:
@@ -771,7 +1221,7 @@ SEVERITY LEVELS:
   P5 — INFO      : Informational findings, optimization suggestions
 ```
 
-### 4.2 Decision Tree (Pseudocode)
+### 9.2 Decision Tree (Pseudocode)
 
 ```python
 class VacuumAgent:
@@ -877,7 +1327,7 @@ class VacuumAgent:
         return findings
 ```
 
-### 4.3 Threshold Configuration
+### 9.3 Threshold Configuration
 
 ```python
 # Default thresholds — should be configurable per environment
@@ -924,9 +1374,9 @@ THRESHOLDS = {
 
 ---
 
-## 5. Remediation Playbooks
+## 10. Remediation Playbooks
 
-### 5.1 Remediation Action Catalog
+### 10.1 Remediation Action Catalog
 
 ```
 REMEDIATION ACTIONS (ordered by risk):
@@ -960,7 +1410,7 @@ NUCLEAR (P0 only, DBA must execute):
   └── pg_resetwal                       — Absolute last resort (data risk)
 ```
 
-### 5.2 Playbook: High Table Bloat
+### 10.2 Playbook: High Table Bloat
 
 ```python
 def remediate_table_bloat(table, bloat_pct, dead_tuples, table_size_gb):
@@ -1014,7 +1464,7 @@ def remediate_table_bloat(table, bloat_pct, dead_tuples, table_size_gb):
     return steps
 ```
 
-### 5.3 Playbook: XID Wraparound Emergency
+### 10.3 Playbook: XID Wraparound Emergency
 
 ```python
 def remediate_wraparound(table, xid_age, severity):
@@ -1070,9 +1520,9 @@ ALTER TABLE {table} SET (
 
 ---
 
-## 6. Interactive Chatbot Design
+## 11. Interactive Chatbot Design
 
-### 6.1 Conversation Flow Architecture
+### 11.1 Conversation Flow Architecture
 
 ```
 USER INPUT
@@ -1098,7 +1548,7 @@ USER INPUT
 └─────────────────────────────────────────────────────┘
 ```
 
-### 6.2 Intent Map
+### 11.2 Intent Map
 
 ```python
 INTENT_MAP = {
@@ -1181,7 +1631,7 @@ INTENT_MAP = {
 }
 ```
 
-### 6.3 Sample Conversations
+### 11.3 Sample Conversations
 
 #### Conversation 1: Health Check
 
@@ -1356,7 +1806,7 @@ AGENT: ✅ Starting cleanup now. Here's what I'm doing:
        Want me to check for that too?
 ```
 
-### 6.4 Response Templates
+### 11.4 Response Templates
 
 ```python
 TEMPLATES = {
@@ -1421,9 +1871,9 @@ Estimated time remaining: ~{eta}
 
 ---
 
-## 7. Autonomous Mode — Continuous Monitoring
+## 12. Autonomous Mode — Continuous Monitoring
 
-### 7.1 Monitoring Schedule
+### 12.1 Monitoring Schedule
 
 ```python
 MONITORING_SCHEDULE = {
@@ -1462,7 +1912,7 @@ MONITORING_SCHEDULE = {
 }
 ```
 
-### 7.2 Alert Escalation
+### 12.2 Alert Escalation
 
 ```python
 ESCALATION_MATRIX = {
@@ -1497,7 +1947,7 @@ ESCALATION_MATRIX = {
 }
 ```
 
-### 7.3 Trend Analysis Queries
+### 12.3 Trend Analysis Queries
 
 ```sql
 -- Q32: Dead tuple growth rate (requires pg_stat_user_tables snapshots)
@@ -1568,9 +2018,9 @@ ORDER BY max(xid_age) DESC;
 
 ---
 
-## 8. Agent State Machine
+## 13. Agent State Machine
 
-### 8.1 States
+### 13.1 States
 
 ```
 ┌─────────┐     ┌──────────┐     ┌───────────┐     ┌──────────┐
@@ -1594,7 +2044,7 @@ ORDER BY max(xid_age) DESC;
                                               └──────────────────────┘
 ```
 
-### 8.2 State Definitions
+### 13.2 State Definitions
 
 ```python
 class AgentState(Enum):
@@ -1634,9 +2084,9 @@ class AgentContext:
 
 ---
 
-## 9. Safety & Guardrails
+## 14. Safety & Guardrails
 
-### 9.1 Never Auto-Execute
+### 14.1 Never Auto-Execute
 
 ```python
 NEVER_AUTO_EXECUTE = [
@@ -1653,7 +2103,7 @@ NEVER_AUTO_EXECUTE = [
 ]
 ```
 
-### 9.2 Pre-Flight Checks
+### 14.2 Pre-Flight Checks
 
 ```python
 def pre_flight_check(action, table, context):
@@ -1699,7 +2149,7 @@ def pre_flight_check(action, table, context):
     return PreFlightResult(safe=True, warnings=checks)
 ```
 
-### 9.3 Rollback Awareness
+### 14.3 Rollback Awareness
 
 ```python
 ROLLBACK_CAPABILITY = {
@@ -1719,9 +2169,9 @@ ROLLBACK_CAPABILITY = {
 
 ---
 
-## 10. Implementation Reference
+## 15. Implementation Reference
 
-### 10.1 Tech Stack Suggestions
+### 15.1 Tech Stack Suggestions
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -1747,7 +2197,7 @@ ROLLBACK_CAPABILITY = {
 └─────────────────────────────────────────────────────┘
 ```
 
-### 10.2 Database Schema for Agent State
+### 15.2 Database Schema for Agent State
 
 ```sql
 -- Schema for the agent's own metadata
@@ -1831,7 +2281,7 @@ CREATE INDEX idx_snapshots_time ON vacuum_agent.stat_snapshots(snapshot_time);
 CREATE INDEX idx_snapshots_table ON vacuum_agent.stat_snapshots(relname, snapshot_time);
 ```
 
-### 10.3 LLM Integration — Function Calling Schema
+### 15.3 LLM Integration — Function Calling Schema
 
 ```python
 # Define tools/functions the LLM agent can call
@@ -1966,7 +2416,7 @@ AGENT_TOOLS = [
 ]
 ```
 
-### 10.4 System Prompt for LLM Agent
+### 15.4 System Prompt for LLM Agent
 
 ```
 You are a PostgreSQL Vacuum Expert Agent. Your role is to detect, diagnose,
@@ -2013,7 +2463,7 @@ KNOWLEDGE:
 - You know pg_repack, pgstattuple, pg_visibility extensions
 ```
 
-### 10.5 Quick Reference — All Queries by Category
+### 15.5 Quick Reference — All Queries by Category
 
 | # | Query | Category | Use Case |
 |---|-------|----------|----------|
