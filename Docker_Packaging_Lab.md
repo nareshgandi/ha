@@ -1,4 +1,4 @@
-# Kumar Server — Docker Packaging Lab
+# — Docker Packaging Lab
 
 ## Goal
 
